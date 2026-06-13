@@ -16,15 +16,17 @@ class XRefTable:
     def size(self) -> int:
         return len(self.entries)
 
-    def serialize(self) -> str:
-        """序列化xref表"""
-        lines = ['xref', f'0 {self.size}']
-        # entry 0: free
-        lines.append(f'{"0":0>10} {"65535":5} f')
+    def serialize(self) -> bytes:
+        """序列化xref表。每个条目恰好20字节(PDF规范§7.5.4)"""
+        parts = []
+        parts.append(b'xref\n')
+        parts.append(f'0 {self.size}\n'.encode('ascii'))
+        # entry 0: free (generation 65535)
+        parts.append(b'0000000000 65535 f \n')
         # entries 1..N: in-use
         for offset in self.entries[1:]:
-            lines.append(f'{offset:0>10} {"00000":5} n')
-        return '\n'.join(lines)
+            parts.append(f'{offset:010d} 00000 n \n'.encode('ascii'))
+        return b''.join(parts)
 
 
 def make_trailer(size: int, root_obj: int) -> str:

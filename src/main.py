@@ -16,6 +16,11 @@ from src.encoders import list_encoders
 
 
 def main():
+    # Windows 终端 GBK 编码无法输出 emoji，强制 UTF-8
+    if sys.platform == 'win32':
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+
     parser = argparse.ArgumentParser(
         description='PDF Image Encoder: 将图像转为多种PDF编码格式',
         formatter_class=argparse.RawDescriptionHelpFormatter,

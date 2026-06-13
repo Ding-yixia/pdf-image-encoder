@@ -23,7 +23,7 @@ from typing import Optional
 from dataclasses import dataclass
 
 from src.encoders.base import EncodeParams
-from src.pdf.objects import PdfStream
+from src.pdf.objects import PdfStream, PdfObject
 from src.pdf.xref import XRefTable, make_trailer
 
 log = logging.getLogger(__name__)
@@ -68,7 +68,8 @@ class PdfBuilder:
         """
         safe_name = image_name[:30]
         pdf_name = f'{safe_name}_{encoder_name}.pdf'
-        pdf_path = self.output_dir / pdf_name
+        pdf_path = self.output_dir / encoder_name / pdf_name
+        pdf_path.parent.mkdir(parents=True, exist_ok=True)
 
         # 特殊处理: complete_pdf (JBIG2等MuPDF生成的完整PDF)
         complete_pdf = getattr(params, 'complete_pdf', None)
@@ -164,18 +165,15 @@ class PdfBuilder:
             disp_w = disp_h * aspect
         cx, cy = (612 - disp_w) / 2, (792 - disp_h) / 2
 
-        smask_data = params.smask
-        # 有SMask时需要额外对象, 对象编号偏移
-        smask_extra = 1 if smask_data else 0
+        smask_data = params.__dict__.get('smask')
 
-        # --- 分配对象编号 ---
+        # --- 分配对象编号 (SMask存在时插入为obj 2, 后续对象顺延) ---
         OBJ_IMG = 1          # 图像XObject
-        OBJ_CONTENT = 2      # 页面内容流
-        OBJ_PAGE = 3         # 页面字典
-        OBJ_PAGES = 4        # 页面树
-        OBJ_CATALOG = 5      # Catalog
-        OBJ_SMASK = 6        # SMask (可选)
-        OBJ_COUNT = 7 if smask_data else 6
+        OBJ_SMASK = 2 if smask_data else None   # SMask (可选, 插入为obj 2)
+        OBJ_CONTENT = 3 if smask_data else 2    # 页面内容流
+        OBJ_PAGE = 4 if smask_data else 3       # 页面字典
+        OBJ_PAGES = 5 if smask_data else 4      # 页面树
+        OBJ_CATALOG = 6 if smask_data else 5    # Catalog
 
         # 构造各个PDF对象
         xref = XRefTable()
@@ -219,47 +217,41 @@ class PdfBuilder:
             s_stream = PdfStream(OBJ_SMASK, smask_data, smask_dict)
             pdf_bytes.extend(s_stream.serialize())
 
-        # --- obj 3(或2): 页面内容流 (Flate压缩) ---
-        obj_n = OBJ_CONTENT + smask_extra
+        # --- 页面内容流 (Flate压缩) ---
         content = f'q {disp_w:.2f} 0 0 {disp_h:.2f} {cx:.2f} {cy:.2f} cm /Im0 Do Q'
         comp = zlib.compress(content.encode('latin-1'))
         content_dict = {'/Length': len(comp), '/Filter': '/FlateDecode'}
         xref.add_entry(len(pdf_bytes))
-        content_stream = PdfStream(obj_n, comp, content_dict)
+        content_stream = PdfStream(OBJ_CONTENT, comp, content_dict)
         pdf_bytes.extend(content_stream.serialize())
 
-        # --- obj 4(或3): 页面字典 (Flate压缩) ---
-        obj_n = OBJ_PAGE + smask_extra
+        # --- 页面字典 (必须是普通字典, 不能是Stream) ---
         page_dict_raw = (
-            f'<< /Type /Page /Parent {OBJ_PAGES + smask_extra} 0 R'
+            f'<< /Type /Page /Parent {OBJ_PAGES} 0 R'
             f' /MediaBox [0 0 612 792]'
-            f' /Contents {OBJ_CONTENT + smask_extra} 0 R'
+            f' /Contents {OBJ_CONTENT} 0 R'
             f' /Resources << /XObject << /Im0 {OBJ_IMG} 0 R >> >>'
             f' >>'
         )
-        page_comp = zlib.compress(page_dict_raw.encode('latin-1'))
         xref.add_entry(len(pdf_bytes))
-        page_stream = PdfStream(obj_n, page_comp,
-                                {'/Length': len(page_comp), '/Filter': '/FlateDecode'})
-        pdf_bytes.extend(page_stream.serialize())
+        page_obj = PdfObject(OBJ_PAGE, page_dict_raw)
+        pdf_bytes.extend(page_obj.serialize())
 
-        # --- obj 5(或4): 页面树 ---
-        obj_n = OBJ_PAGES + smask_extra
+        # --- 页面树 ---
         xref.add_entry(len(pdf_bytes))
-        pages = f'<< /Type /Pages /Kids [{OBJ_PAGE + smask_extra} 0 R] /Count 1 >>'
-        pdf_bytes.extend(f'{obj_n} 0 obj\n{pages}\nendobj\n'.encode('latin-1'))
+        pages = f'<< /Type /Pages /Kids [{OBJ_PAGE} 0 R] /Count 1 >>'
+        pdf_bytes.extend(f'{OBJ_PAGES} 0 obj\n{pages}\nendobj\n'.encode('latin-1'))
 
-        # --- obj 6(或5): Catalog ---
-        obj_n = OBJ_CATALOG + smask_extra
+        # --- Catalog ---
         xref.add_entry(len(pdf_bytes))
-        catalog = f'<< /Type /Catalog /Pages {OBJ_PAGES + smask_extra} 0 R >>'
-        pdf_bytes.extend(f'{obj_n} 0 obj\n{catalog}\nendobj\n'.encode('latin-1'))
+        catalog = f'<< /Type /Catalog /Pages {OBJ_PAGES} 0 R >>'
+        pdf_bytes.extend(f'{OBJ_CATALOG} 0 obj\n{catalog}\nendobj\n'.encode('latin-1'))
 
         # --- xref + trailer ---
         xref_offset = len(pdf_bytes)
-        pdf_bytes.extend(xref.serialize().encode('latin-1'))
+        pdf_bytes.extend(xref.serialize())
         pdf_bytes.extend(b'\n')
-        pdf_bytes.extend(make_trailer(xref.size, OBJ_CATALOG + smask_extra).encode('latin-1'))
+        pdf_bytes.extend(make_trailer(xref.size, OBJ_CATALOG).encode('latin-1'))
         pdf_bytes.extend(b'\n')
         pdf_bytes.extend(f'startxref\n{xref_offset}\n%%EOF\n'.encode('latin-1'))
 
