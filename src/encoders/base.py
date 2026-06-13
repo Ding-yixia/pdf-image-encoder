@@ -17,6 +17,7 @@ class EncodeParams:
     pre_compressed: bool = False    # True=数据已压缩, save时不额外压缩
     decode_parms: Optional[dict] = None  # CCITT等需要的解码参数
     smask: Optional[bytes] = None   # Alpha通道数据(SMask灰度图), None=无透明度
+    complete_pdf: Optional[bytes] = None  # 完整PDF字节(JBIG2直接用MuPDF生成)
 
 
 class Encoder(ABC):

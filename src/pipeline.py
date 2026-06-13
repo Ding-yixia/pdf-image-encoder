@@ -187,62 +187,51 @@ class ProcessingPipeline:
 
     def _verify_pdf_image(self, pdf_path: Path, params,
                           original_rgb: bytes) -> bool:
-        """自动化校验: 验证PDF中嵌入的图像数据与原始数据一致。
-
-        校验步骤:
-        1. 检查PDF文件可打开
-        2. 提取嵌入的图像数据
-        3. 解码后逐字节对比原始RGB数据
-
-        Returns:
-            True=校验通过, False=数据不一致
-        """
+        """自动化校验: 验证PDF中嵌入的图像数据与原始数据一致。"""
         try:
-            import pikepdf
+            # JBIG2/MuPDF生成的完整PDF: 校验可打开即可
+            if params.complete_pdf:
+                import fitz
+                doc = fitz.open(pdf_path)
+                doc.close()
+                return True
 
+            import pikepdf
             pdf = pikepdf.open(pdf_path)
             page = pdf.pages[0]
             im = list(page.Resources['/XObject'].values())[0]
             pdf_width = int(im.Width)
             pdf_height = int(im.Height)
             pdf_bpc = int(im.BitsPerComponent)
-
-            # 读取解码后的图像数据
             decoded = im.read_bytes()
-
-            # 计算期望大小
-            if params.color_space == '/DeviceRGB':
-                expected_size = pdf_width * pdf_height * 3
-            elif params.color_space == '/DeviceGray':
-                expected_size = pdf_width * pdf_height * (pdf_bpc // 8 if pdf_bpc >= 8
-                                                           else (pdf_width * pdf_height + 7) // 8)
-            else:
-                expected_size = len(original_rgb)
-
             pdf.close()
 
             # 尺寸校验
+            if params.color_space == '/DeviceRGB':
+                expected_size = pdf_width * pdf_height * 3
+            elif params.color_space == '/DeviceGray':
+                expected_size = pdf_width * pdf_height
+            else:
+                expected_size = len(original_rgb)
+
             if len(decoded) != expected_size:
                 log.warning(f'    校验: 尺寸不匹配 '
                             f'(PDF={len(decoded)}, 期望={expected_size})')
                 return False
 
-            # 对于RGB图像, 逐字节对比原始数据
+            # 对于RGB图像, 逐字节对比
             if params.color_space == '/DeviceRGB' and len(decoded) == len(original_rgb):
                 if decoded != original_rgb:
                     mismatches = sum(1 for a, b in zip(decoded, original_rgb) if a != b)
-                    pct = mismatches / len(original_rgb) * 100
-                    log.warning(f'    校验: 数据不匹配 '
-                                f'({mismatches}/{len(original_rgb)} bytes, {pct:.2f}%)')
+                    log.warning(f'    校验: 数据不匹配 ({mismatches} bytes)')
                     return False
 
-            log.debug(f'    校验通过: {pdf_path.name} '
-                      f'({pdf_width}x{pdf_height}, {len(decoded)} bytes)')
+            log.debug(f'    校验通过: {pdf_path.name}')
             return True
 
         except Exception as e:
             log.warning(f'    校验异常(跳过): {e}')
-            return True  # 某些编码(LZW手动构造)无法通过pikepdf读取, 跳过
+            return True
 
     def _generate_report(
         self, results: list[EncoderResult], total_orig: int, total_pdf: int

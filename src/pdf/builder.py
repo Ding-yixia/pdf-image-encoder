@@ -70,6 +70,14 @@ class PdfBuilder:
         pdf_name = f'{safe_name}_{encoder_name}.pdf'
         pdf_path = self.output_dir / pdf_name
 
+        # 特殊处理: complete_pdf (JBIG2等MuPDF生成的完整PDF)
+        complete_pdf = getattr(params, 'complete_pdf', None)
+        if complete_pdf:
+            pdf_path.write_bytes(complete_pdf)
+            log.debug(f'  [complete_pdf] {pdf_path.name}')
+            return PdfBuildResult(path=pdf_path, size_bytes=pdf_path.stat().st_size,
+                                  method='mupdf')
+
         if params.filter in MANUAL_ENCODINGS or params.filter is None:
             return self._build_manual(image_data, params, pdf_path)
         else:
