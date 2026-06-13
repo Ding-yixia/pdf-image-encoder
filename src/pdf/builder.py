@@ -1,0 +1,228 @@
+"""PDF构造器: 统一接口, 内部根据编码类型选择不同构造策略
+
+策略说明:
+- A策略 (pikepdf): 适用于DCT/Flate/JPX/CCITT等pikepdf原生支持的编码
+- B策略 (手动构造): 适用于LZW/RLE/Raw等pikepdf不支持或会自动转换的编码
+
+手动构造B策略的PDF结构:
+  %PDF-1.4
+  1 0 obj  (图像XObject: /Filter /LZWDecode)
+  2 0 obj  (页面内容流)
+  3 0 obj  (页面字典)
+  4 0 obj  (页面树)
+  5 0 obj  (Catalog)
+  xref
+  trailer
+  startxref
+  %%EOF
+"""
+import zlib
+import logging
+from pathlib import Path
+from typing import Optional
+from dataclasses import dataclass
+
+from src.encoders.base import EncodeParams
+from src.pdf.objects import PdfStream
+from src.pdf.xref import XRefTable, make_trailer
+
+log = logging.getLogger(__name__)
+
+# 需要手动构造B策略的编码
+MANUAL_ENCODINGS = {'/LZWDecode', '/RunLengthDecode'}
+
+
+@dataclass
+class PdfBuildResult:
+    """PDF构造结果"""
+    path: Path
+    size_bytes: int
+    method: str          # 'pikepdf' or 'manual'
+
+
+class PdfBuilder:
+    """PDF构造器: 支持pikepdf和手动两种构造策略"""
+
+    def __init__(self, output_dir: Path):
+        self.output_dir = output_dir
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+    def build(
+        self,
+        image_data: bytes,
+        params: EncodeParams,
+        image_name: str,
+        encoder_name: str,
+    ) -> PdfBuildResult:
+        """
+        创建包含指定编码图像的PDF。
+
+        Args:
+            image_data: 编码后的图像数据
+            params: 编码参数
+            image_name: 源图像名称(用于PDF文件名)
+            encoder_name: 编码器名称
+
+        Returns:
+            PdfBuildResult
+        """
+        safe_name = image_name[:30]
+        pdf_name = f'{safe_name}_{encoder_name}.pdf'
+        pdf_path = self.output_dir / pdf_name
+
+        if params.filter in MANUAL_ENCODINGS or params.filter is None:
+            return self._build_manual(image_data, params, pdf_path)
+        else:
+            return self._build_pikepdf(image_data, params, pdf_path)
+
+    def _build_pikepdf(
+        self, image_data: bytes, params: EncodeParams, pdf_path: Path
+    ) -> PdfBuildResult:
+        """A策略: 使用pikepdf生成"""
+        import pikepdf
+
+        pdf = pikepdf.Pdf.new()
+        pdf.add_blank_page(page_size=(612, 792))
+        page = pdf.pages[0]
+
+        # 构造图像XObject (先make_stream, 再设置属性)
+        xobj = pdf.make_stream(image_data)
+        xobj.Type = pikepdf.Name('/XObject')
+        xobj.Subtype = pikepdf.Name('/Image')
+        xobj.Width = params.width
+        xobj.Height = params.height
+        xobj.ColorSpace = pikepdf.Name(params.color_space)
+        xobj.BitsPerComponent = params.bits_per_component
+        if params.filter:
+            xobj.Filter = pikepdf.Name(params.filter)
+        if params.decode_parms:
+            dp = pikepdf.Dictionary()
+            for k, v in params.decode_parms.items():
+                dp['/' + k] = v if not isinstance(v, bool) else pikepdf.Name('/true' if v else '/false')
+            xobj.DecodeParms = dp
+
+        # 放置到页面
+        aspect = params.width / params.height
+        disp_w = min(500, 700 * aspect)
+        disp_h = disp_w / aspect
+        if disp_h > 700:
+            disp_h = 700
+            disp_w = disp_h * aspect
+        cx, cy = (612 - disp_w) / 2, (792 - disp_h) / 2
+
+        page.Resources = pikepdf.Dictionary({
+            '/XObject': pikepdf.Dictionary({
+                '/Im0': pdf.make_indirect(xobj)
+            })
+        })
+        content = f'q {disp_w:.2f} 0 0 {disp_h:.2f} {cx:.2f} {cy:.2f} cm /Im0 Do Q'
+        content_stream = pdf.make_stream(zlib.compress(content.encode('latin-1')))
+        content_stream.Filter = pikepdf.Name('/FlateDecode')
+        page.Contents = content_stream
+
+        pdf.save(pdf_path, compress_streams=False)
+        pdf.close()
+
+        log.debug(f'  [pikepdf] 已生成: {pdf_path.name}')
+        return PdfBuildResult(path=pdf_path, size_bytes=pdf_path.stat().st_size,
+                              method='pikepdf')
+
+    def _build_manual(
+        self, image_data: bytes, params: EncodeParams, pdf_path: Path
+    ) -> PdfBuildResult:
+        """B策略: 手动构造PDF字节 (避免pikepdf替换Filter)"""
+        w, h = params.width, params.height
+
+        # 计算显示尺寸
+        aspect = w / h
+        disp_w = min(500, 700 * aspect)
+        disp_h = disp_w / aspect
+        if disp_h > 700:
+            disp_h = 700
+            disp_w = disp_h * aspect
+        cx, cy = (612 - disp_w) / 2, (792 - disp_h) / 2
+
+        # 构造各个PDF对象
+        xref = XRefTable()
+        pdf_bytes = bytearray(b'%PDF-1.4\n')
+
+        # --- obj 1: 图像XObject ---
+        img_dict = {
+            '/Type': '/XObject',
+            '/Subtype': '/Image',
+            '/Width': w,
+            '/Height': h,
+            '/ColorSpace': params.color_space,
+            '/BitsPerComponent': params.bits_per_component,
+            '/Length': len(image_data),
+        }
+        if params.filter:
+            img_dict['/Filter'] = params.filter
+        if params.decode_parms:
+            img_dict['/DecodeParms'] = _dict_to_pdf(params.decode_parms)
+
+        xref.add_entry(len(pdf_bytes))
+        stream = PdfStream(1, image_data, img_dict)
+        pdf_bytes.extend(stream.serialize())
+
+        # --- obj 2: 页面内容流 (Flate压缩) ---
+        content = f'q {disp_w:.2f} 0 0 {disp_h:.2f} {cx:.2f} {cy:.2f} cm /Im0 Do Q'
+        comp = zlib.compress(content.encode('latin-1'))
+        content_dict = {'/Length': len(comp), '/Filter': '/FlateDecode'}
+        xref.add_entry(len(pdf_bytes))
+        content_stream = PdfStream(2, comp, content_dict)
+        pdf_bytes.extend(content_stream.serialize())
+
+        # --- obj 3: 页面字典 (Flate压缩) ---
+        page_dict_raw = (
+            '<< /Type /Page /Parent 4 0 R'
+            ' /MediaBox [0 0 612 792]'
+            ' /Contents 2 0 R'
+            ' /Resources << /XObject << /Im0 1 0 R >> >>'
+            ' >>'
+        )
+        page_comp = zlib.compress(page_dict_raw.encode('latin-1'))
+        xref.add_entry(len(pdf_bytes))
+        page_stream = PdfStream(3, page_comp,
+                                {'/Length': len(page_comp), '/Filter': '/FlateDecode'})
+        pdf_bytes.extend(page_stream.serialize())
+
+        # --- obj 4: 页面树 ---
+        xref.add_entry(len(pdf_bytes))
+        pages = '<< /Type /Pages /Kids [3 0 R] /Count 1 >>'
+        pdf_bytes.extend(f'4 0 obj\n{pages}\nendobj\n'.encode('latin-1'))
+
+        # --- obj 5: Catalog ---
+        xref.add_entry(len(pdf_bytes))
+        catalog = '<< /Type /Catalog /Pages 4 0 R >>'
+        pdf_bytes.extend(f'5 0 obj\n{catalog}\nendobj\n'.encode('latin-1'))
+
+        # --- xref + trailer ---
+        xref_offset = len(pdf_bytes)
+        pdf_bytes.extend(xref.serialize().encode('latin-1'))
+        pdf_bytes.extend(b'\n')
+        pdf_bytes.extend(make_trailer(xref.size, 5).encode('latin-1'))
+        pdf_bytes.extend(b'\n')
+        pdf_bytes.extend(f'startxref\n{xref_offset}\n%%EOF\n'.encode('latin-1'))
+
+        # 写入文件
+        pdf_path.write_bytes(bytes(pdf_bytes))
+        log.debug(f'  [manual] 已生成: {pdf_path.name} (xref={xref_offset})')
+        return PdfBuildResult(path=pdf_path, size_bytes=pdf_path.stat().st_size,
+                              method='manual')
+
+
+def _dict_to_pdf(d: dict) -> str:
+    """将Python字典转为PDF字典字符串 << /K v >>"""
+    items = ' '.join(f'/{k} {_pdf_val(v)}' for k, v in d.items())
+    return f'<< {items} >>'
+
+
+def _pdf_val(v):
+    if isinstance(v, bool):
+        return 'true' if v else 'false'
+    if isinstance(v, int):
+        return str(v)
+    if isinstance(v, float):
+        return f'{v}'
+    return str(v)

@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.spec
+.pytest_cache/
+
+# Project output
+output/
+
+# IDE
+.vs/
+.vscode/
+.idea/
+*.swp
+
+# Build
+*.exe
+*.dll
+*.pyd
+
+# Logs
+*.log
+
+# OS
+Thumbs.db
+.DS_Store
