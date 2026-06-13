@@ -40,6 +40,10 @@ pdf_image_encoder/
 ├── config/default.yaml             # 默认配置文件
 ├── docs/encoding_spec.md           # 编码格式技术说明
 ├── build_exe.py                    # PyInstaller打包脚本
+├── examples/                       # 示例PDF文件(7种编码 x 3图像)
+│   ├── pdfs/                       #   21个PDF文件
+│   ├── all_pdfs.zip                #   全部打包(1.5MB)
+│   └── report.txt                  #   处理报告
 └── output/                         # 输出目录(运行时生成)
 ```
 

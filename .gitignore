@@ -9,6 +9,7 @@ build/
 
 # Project output
 output/
+!examples/
 
 # IDE
 .vs/
