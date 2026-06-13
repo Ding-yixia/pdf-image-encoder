@@ -1,27 +1,30 @@
-"""透明度挖空效果: 在图像中心生成随机不规则透明区域
+"""透明度挖孔效果: 在图像中心散落若干小圆孔/三角孔/多边形孔
 
 用于增强 PDF SMask 的透明视觉效果。
 
 算法:
-1. 在图像中心区域生成随机种子点
-2. 通过多次叠加随机椭圆形+噪声产生不规则有机形状
-3. 高斯模糊实现平滑边缘过渡
-4. 阈值化确保挖空区域完全透明
+1. 在图像中心区域随机散布 N 个孔位
+2. 每个孔随机选择形状: 圆形 / 三角形 / 多边形(4~8边)
+3. 每个孔大小随机, 位置微偏移, 轻微旋转避免呆板
+4. 小半径高斯模糊让边缘自然过渡
+5. 阈值化确保孔内完全透明, 孔外保持不透明
 """
 
 import random
 import logging
+import math
 import numpy as np
-from PIL import Image, ImageFilter
+from PIL import Image, ImageFilter, ImageDraw
 
 log = logging.getLogger(__name__)
 
 
 class TransparencyCutout:
-    """图像中心随机挖空透明度效果
+    """图像中心随机多孔挖空透明度效果
 
-    对输入的 RGB/RGBA 图像在中心区域生成不规则透明孔洞,
-    保持非挖空区域的原始透明度不变。
+    在图像中心区域散布若干独立的小孔(圆形/三角形/多边形),
+    每个孔完全透明, 孔之间互不连通(或少量重叠),
+    保持非孔区域的原始透明度不变。
     """
 
     def __init__(self, seed: int | None = None):
@@ -34,20 +37,25 @@ class TransparencyCutout:
     def apply(
         self,
         image: Image.Image,
-        cutout_ratio: float = 0.35,
-        feather_radius: int | None = None,
+        hole_count: int | None = None,
+        hole_min_ratio: float = 0.03,
+        hole_max_ratio: float = 0.12,
+        feather_radius: int = 3,
     ) -> Image.Image:
-        """在图像中心创建随机不规则透明挖空区域。
+        """在图像中心区域散布多个小孔。
 
         Args:
             image: PIL Image (RGB或RGBA)
-            cutout_ratio: 挖空区域占图像的比例 (0.1~0.5)
-            feather_radius: 边缘羽化半径, None=自动计算
+            hole_count: 孔数量, None=自动(8~20)
+            hole_min_ratio: 单个孔最小半径占图像短边的比例
+            hole_max_ratio: 单个孔最大半径占图像短边的比例
+            feather_radius: 孔边缘羽化半径(px), 建议 2~5
 
         Returns:
-            RGBA模式的图像, 中心有不规则透明区域
+            RGBA模式的图像, 中心区域散布若干透明孔
         """
         w, h = image.size
+        short_side = min(w, h)
 
         # 确保RGBA
         if image.mode == 'RGBA':
@@ -57,138 +65,122 @@ class TransparencyCutout:
         else:
             rgba = image.convert('RGBA')
 
-        # 生成随机不规则挖空蒙版
-        mask = self._generate_organic_mask(w, h, cutout_ratio, feather_radius)
+        # 自动孔数
+        if hole_count is None:
+            hole_count = self.rng.randint(8, 20)
 
-        # 叠加蒙版: mask=0处完全透明, mask=255处保持原始透明度
+        # 生成多孔蒙版
+        mask = self._generate_multi_hole_mask(
+            w, h, hole_count, hole_min_ratio, hole_max_ratio, feather_radius
+        )
+
+        # 叠加蒙版
         r, g, b, a = rgba.split()
         alpha_arr = np.array(a, dtype=np.float32)
         mask_arr = np.array(mask, dtype=np.float32)
 
-        # 取最小值: 既保留原始透明区域, 又添加挖空透明区域
+        # 取最小值: 孔区域变透明, 保留原始透明区域
         new_alpha = np.minimum(alpha_arr, mask_arr).astype(np.uint8)
         new_a = Image.fromarray(new_alpha, mode='L')
 
         result = Image.merge('RGBA', (r, g, b, new_a))
+        transparent_px = int(np.sum(new_alpha < 255))
         log.debug(
-            f'  挖空效果: {w}x{h}, cutout_ratio={cutout_ratio}, '
-            f'透明像素={int(np.sum(new_alpha < 255))}'
+            f'  挖孔效果: {w}x{h}, {hole_count}孔, '
+            f'透明像素={transparent_px} '
+            f'({transparent_px / new_alpha.size * 100:.1f}%)'
         )
         return result
 
-    def _generate_organic_mask(
+    def _generate_multi_hole_mask(
         self,
         w: int,
         h: int,
-        cutout_ratio: float,
-        feather_radius: int | None,
+        hole_count: int,
+        min_ratio: float,
+        max_ratio: float,
+        feather: int,
     ) -> Image.Image:
-        """生成中心不规则挖空蒙版。
+        """生成多孔蒙版。
 
-        白色(255)=不透明, 黑色(0)=完全透明(挖空)。
+        白色(255)=不透明, 黑色(0)=孔(透明)。
         """
-        # 计算中心区域边界 (图像中央约50%区域)
+        short_side = min(w, h)
+        min_r = int(short_side * min_ratio)
+        max_r = int(short_side * max_ratio)
+
+        # 全白画布
+        mask = Image.new('L', (w, h), 255)
+        draw = ImageDraw.Draw(mask)
+
+        # 中心区域内随机散布孔
+        # 约束在中心 60% 区域内, 避免挖到边缘
         cx, cy = w // 2, h // 2
-        region_w = int(w * 0.6)
-        region_h = int(h * 0.6)
-        x0 = cx - region_w // 2
-        y0 = cy - region_h // 2
-        x1 = x0 + region_w
-        y1 = y0 + region_h
+        spread_w = int(w * 0.55)
+        spread_h = int(h * 0.55)
 
-        # 在中心区域创建随机种子图层
-        # 使用多个随机噪声圆叠加产生不规则形状
-        blob_count = self.rng.randint(4, 9)
-        canvas = np.zeros((h, w), dtype=np.float32)
-        base_radius = min(w, h) * cutout_ratio * 0.4
+        for i in range(hole_count):
+            # 随机孔心位置 (中心区域)
+            px = self.rng.randint(cx - spread_w // 2, cx + spread_w // 2)
+            py = self.rng.randint(cy - spread_h // 2, cy + spread_h // 2)
 
-        for _ in range(blob_count):
-            # 随机位置 (偏向中心)
-            bx = self.rng.randint(
-                int(w * 0.25), int(w * 0.75)
-            )
-            by = self.rng.randint(
-                int(h * 0.25), int(h * 0.75)
-            )
-            # 随机椭圆大小和形状
-            rx = base_radius * self.rng.uniform(0.5, 1.5)
-            ry = base_radius * self.rng.uniform(0.5, 1.5)
-            # 随机旋转
-            angle = self.rng.uniform(0, 360)
-            # 随机不透明度
-            opacity = self.rng.uniform(0.4, 0.9)
+            # 随机半径
+            radius = self.rng.randint(min_r, max_r)
 
-            blob = self._make_ellipse(w, h, bx, by, rx, ry, angle)
-            # 边缘添加随机扰动
-            canvas += blob * opacity
+            # 随机形状
+            shape_type = self.rng.choice(['circle', 'triangle', 'polygon'])
+            rotation = self.rng.uniform(0, 360)
 
-        # 裁剪到 [0, 1]
-        canvas = np.clip(canvas, 0, 1)
+            if shape_type == 'circle':
+                self._draw_circle(draw, px, py, radius)
+            elif shape_type == 'triangle':
+                self._draw_polygon(draw, px, py, radius, 3, rotation)
+            else:
+                sides = self.rng.randint(4, 8)
+                self._draw_polygon(draw, px, py, radius, sides, rotation)
 
-        # 添加 Perlin-like 噪声让边缘更自然
-        noise = self._generate_noise(w, h, scale=min(w, h) * 0.05)
-        canvas = np.clip(canvas + noise * 0.15, 0, 1)
+        # 高斯模糊让边缘自然
+        mask = mask.filter(ImageFilter.GaussianBlur(radius=feather))
 
-        # 高斯模糊 → 平滑过渡
-        if feather_radius is None:
-            feather_radius = max(int(min(w, h) * 0.03), 3)
-        blur_radius = max(feather_radius, 3)
+        # 阈值化: 孔内部纯黑, 外部纯白
+        # 阈值 128 取中位, 让羽化区域半透明
+        mask = mask.point(lambda p: 0 if p < 128 else 255)
 
-        canvas_img = Image.fromarray((canvas * 255).astype(np.uint8), mode='L')
-        canvas_img = canvas_img.filter(
-            ImageFilter.GaussianBlur(radius=blur_radius)
-        )
-
-        # 阈值化: 挖空区域变为纯黑(0), 非挖空区域保持纯白(255)
-        # 阈值在中间值让边缘自然过渡
-        threshold = 180
-        mask = canvas_img.point(lambda p: 0 if p < threshold else 255)
-
-        # 最终轻微模糊让边缘更自然
-        mask = mask.filter(ImageFilter.GaussianBlur(radius=2))
+        # 极轻微模糊让锯齿平滑
+        mask = mask.filter(ImageFilter.GaussianBlur(radius=1))
 
         return mask
 
-    def _make_ellipse(
-        self, w: int, h: int,
-        cx: float, cy: float,
-        rx: float, ry: float,
-        angle: float,
-    ) -> np.ndarray:
-        """生成旋转椭圆渐变层。"""
-        y, x = np.ogrid[:h, :w]
-        theta = np.radians(angle)
-        cos_a, sin_a = np.cos(theta), np.sin(theta)
+    def _draw_circle(
+        self, draw: ImageDraw.Draw, cx: int, cy: int, r: int
+    ) -> None:
+        """在蒙版上绘制黑色圆形孔。"""
+        bbox = (cx - r, cy - r, cx + r, cy + r)
+        draw.ellipse(bbox, fill=0)
 
-        dx = x - cx
-        dy = y - cy
-        x_rot = dx * cos_a + dy * sin_a
-        y_rot = -dx * sin_a + dy * cos_a
+    def _draw_polygon(
+        self,
+        draw: ImageDraw.Draw,
+        cx: int, cy: int,
+        radius: int,
+        sides: int,
+        rotation: float,
+    ) -> None:
+        """在蒙版上绘制黑色正多边形孔。"""
+        vertices = []
+        angle_offset = math.radians(rotation)
+        start_angle = angle_offset - math.pi / 2  # 从顶部开始
 
-        dist = (x_rot / rx) ** 2 + (y_rot / ry) ** 2
-        # 平滑衰减
-        blob = np.exp(-dist * 0.5)
-        return blob.astype(np.float32)
+        for i in range(sides):
+            angle = start_angle + 2 * math.pi * i / sides
+            vx = cx + radius * math.cos(angle)
+            vy = cy + radius * math.sin(angle)
+            vertices.append((vx, vy))
 
-    def _generate_noise(
-        self, w: int, h: int, scale: float = 10.0
-    ) -> np.ndarray:
-        """生成简单噪声场 (近似Perlin效果)。"""
-        # 低分辨率随机场 → PIL放大上采样 → 平滑
-        small_w = max(int(w / scale), 2)
-        small_h = max(int(h / scale), 2)
-
-        small = np.random.uniform(0, 255, (small_h, small_w)).astype(np.uint8)
-        small_img = Image.fromarray(small, mode='L')
-        noise_img = small_img.resize((w, h), Image.BILINEAR)
-        noise = np.array(noise_img, dtype=np.float32)
-
-        # 归一化到 [-1, 1]
-        noise = noise / 127.5 - 1.0
-        return noise.astype(np.float32)
+        draw.polygon(vertices, fill=0)
 
 
 def apply_cutout(image: Image.Image, **kwargs) -> Image.Image:
-    """快捷函数: 对图像应用随机挖空效果。"""
+    """快捷函数: 对图像应用随机多孔挖空效果。"""
     effect = TransparencyCutout()
     return effect.apply(image, **kwargs)
