@@ -2,10 +2,10 @@
 
 ## 概况
 
-- **源图像**: 365张 (D:\wallpapers)
-- **编码格式**: 7种 (Raw/Flate/DCT/JPX/CCITT/RLE/LZW)
-- **PDF总数**: 2,555个
-- **总大小**: ~105 MB (分割为10个ZIP, 每个≤20MB)
+- **源图像**: 365张来自 D:\wallpapers + 9张透明度测试图
+- **编码格式**: 8种 (Raw/Flate/DCT/JPX/CCITT/RLE/LZW/**Alpha**)
+- **PDF总数**: 2,564个
+- **总大小**: ~106 MB (分割为11个ZIP, 每个≤20MB)
 
 ## 目录结构
 
@@ -28,6 +28,8 @@ archives/
 │   └── part02.zip  ( 2MB, 178个PDF)
 └── LZW/
     └── part01.zip  (19MB, 365个PDF)
+└── Alpha/
+    └── part01.zip  ( 1MB,   9个PDF)  ← 透明度测试
 ```
 
 ## 编码效率

@@ -101,6 +101,20 @@ class PdfBuilder:
                 dp['/' + k] = v if not isinstance(v, bool) else pikepdf.Name('/true' if v else '/false')
             xobj.DecodeParms = dp
 
+        # Alpha/透明度: 添加SMask
+        smask_data = params.__dict__.get('smask')
+        smask_obj = None
+        if smask_data:
+            smask_obj = pdf.make_stream(smask_data)
+            smask_obj.Type = pikepdf.Name('/XObject')
+            smask_obj.Subtype = pikepdf.Name('/Image')
+            smask_obj.Width = params.width
+            smask_obj.Height = params.height
+            smask_obj.ColorSpace = pikepdf.Name('/DeviceGray')
+            smask_obj.BitsPerComponent = 8
+            smask_obj.Filter = pikepdf.Name(params.filter) if params.filter else None
+            xobj.SMask = pdf.make_indirect(smask_obj)
+
         # 放置到页面
         aspect = params.width / params.height
         disp_w = min(500, 700 * aspect)
@@ -142,6 +156,19 @@ class PdfBuilder:
             disp_w = disp_h * aspect
         cx, cy = (612 - disp_w) / 2, (792 - disp_h) / 2
 
+        smask_data = params.smask
+        # 有SMask时需要额外对象, 对象编号偏移
+        smask_extra = 1 if smask_data else 0
+
+        # --- 分配对象编号 ---
+        OBJ_IMG = 1          # 图像XObject
+        OBJ_CONTENT = 2      # 页面内容流
+        OBJ_PAGE = 3         # 页面字典
+        OBJ_PAGES = 4        # 页面树
+        OBJ_CATALOG = 5      # Catalog
+        OBJ_SMASK = 6        # SMask (可选)
+        OBJ_COUNT = 7 if smask_data else 6
+
         # 构造各个PDF对象
         xref = XRefTable()
         pdf_bytes = bytearray(b'%PDF-1.4\n')
@@ -160,48 +187,71 @@ class PdfBuilder:
             img_dict['/Filter'] = params.filter
         if params.decode_parms:
             img_dict['/DecodeParms'] = _dict_to_pdf(params.decode_parms)
+        if smask_data:
+            img_dict['/SMask'] = f'{OBJ_SMASK} 0 R'
 
         xref.add_entry(len(pdf_bytes))
-        stream = PdfStream(1, image_data, img_dict)
+        stream = PdfStream(OBJ_IMG, image_data, img_dict)
         pdf_bytes.extend(stream.serialize())
 
-        # --- obj 2: 页面内容流 (Flate压缩) ---
+        # --- obj 2: SMask (仅Alpha编码) ---
+        if smask_data:
+            smask_dict = {
+                '/Type': '/XObject',
+                '/Subtype': '/Image',
+                '/Width': w,
+                '/Height': h,
+                '/ColorSpace': '/DeviceGray',
+                '/BitsPerComponent': 8,
+                '/Length': len(smask_data),
+            }
+            if params.filter:
+                smask_dict['/Filter'] = params.filter
+            xref.add_entry(len(pdf_bytes))
+            s_stream = PdfStream(OBJ_SMASK, smask_data, smask_dict)
+            pdf_bytes.extend(s_stream.serialize())
+
+        # --- obj 3(或2): 页面内容流 (Flate压缩) ---
+        obj_n = OBJ_CONTENT + smask_extra
         content = f'q {disp_w:.2f} 0 0 {disp_h:.2f} {cx:.2f} {cy:.2f} cm /Im0 Do Q'
         comp = zlib.compress(content.encode('latin-1'))
         content_dict = {'/Length': len(comp), '/Filter': '/FlateDecode'}
         xref.add_entry(len(pdf_bytes))
-        content_stream = PdfStream(2, comp, content_dict)
+        content_stream = PdfStream(obj_n, comp, content_dict)
         pdf_bytes.extend(content_stream.serialize())
 
-        # --- obj 3: 页面字典 (Flate压缩) ---
+        # --- obj 4(或3): 页面字典 (Flate压缩) ---
+        obj_n = OBJ_PAGE + smask_extra
         page_dict_raw = (
-            '<< /Type /Page /Parent 4 0 R'
-            ' /MediaBox [0 0 612 792]'
-            ' /Contents 2 0 R'
-            ' /Resources << /XObject << /Im0 1 0 R >> >>'
-            ' >>'
+            f'<< /Type /Page /Parent {OBJ_PAGES + smask_extra} 0 R'
+            f' /MediaBox [0 0 612 792]'
+            f' /Contents {OBJ_CONTENT + smask_extra} 0 R'
+            f' /Resources << /XObject << /Im0 {OBJ_IMG} 0 R >> >>'
+            f' >>'
         )
         page_comp = zlib.compress(page_dict_raw.encode('latin-1'))
         xref.add_entry(len(pdf_bytes))
-        page_stream = PdfStream(3, page_comp,
+        page_stream = PdfStream(obj_n, page_comp,
                                 {'/Length': len(page_comp), '/Filter': '/FlateDecode'})
         pdf_bytes.extend(page_stream.serialize())
 
-        # --- obj 4: 页面树 ---
+        # --- obj 5(或4): 页面树 ---
+        obj_n = OBJ_PAGES + smask_extra
         xref.add_entry(len(pdf_bytes))
-        pages = '<< /Type /Pages /Kids [3 0 R] /Count 1 >>'
-        pdf_bytes.extend(f'4 0 obj\n{pages}\nendobj\n'.encode('latin-1'))
+        pages = f'<< /Type /Pages /Kids [{OBJ_PAGE + smask_extra} 0 R] /Count 1 >>'
+        pdf_bytes.extend(f'{obj_n} 0 obj\n{pages}\nendobj\n'.encode('latin-1'))
 
-        # --- obj 5: Catalog ---
+        # --- obj 6(或5): Catalog ---
+        obj_n = OBJ_CATALOG + smask_extra
         xref.add_entry(len(pdf_bytes))
-        catalog = '<< /Type /Catalog /Pages 4 0 R >>'
-        pdf_bytes.extend(f'5 0 obj\n{catalog}\nendobj\n'.encode('latin-1'))
+        catalog = f'<< /Type /Catalog /Pages {OBJ_PAGES + smask_extra} 0 R >>'
+        pdf_bytes.extend(f'{obj_n} 0 obj\n{catalog}\nendobj\n'.encode('latin-1'))
 
         # --- xref + trailer ---
         xref_offset = len(pdf_bytes)
         pdf_bytes.extend(xref.serialize().encode('latin-1'))
         pdf_bytes.extend(b'\n')
-        pdf_bytes.extend(make_trailer(xref.size, 5).encode('latin-1'))
+        pdf_bytes.extend(make_trailer(xref.size, OBJ_CATALOG + smask_extra).encode('latin-1'))
         pdf_bytes.extend(b'\n')
         pdf_bytes.extend(f'startxref\n{xref_offset}\n%%EOF\n'.encode('latin-1'))
 

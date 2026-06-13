@@ -8,6 +8,8 @@ from .ccitt import CCITTEncoder
 from .rle import RLEEncoder
 from .lzw import LZWEncoder
 
+from .alpha import AlphaEncoder
+
 REGISTRY: dict[str, type[Encoder]] = {
     'Raw':   RawEncoder,
     'Flate': FlateEncoder,
@@ -16,6 +18,7 @@ REGISTRY: dict[str, type[Encoder]] = {
     'CCITT': CCITTEncoder,
     'RLE':   RLEEncoder,
     'LZW':   LZWEncoder,
+    'Alpha': AlphaEncoder,
 }
 
 def get_encoder(name: str) -> Encoder:
