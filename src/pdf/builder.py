@@ -106,7 +106,7 @@ class PdfBuilder:
         if params.decode_parms:
             dp = pikepdf.Dictionary()
             for k, v in params.decode_parms.items():
-                dp['/' + k] = v if not isinstance(v, bool) else pikepdf.Name('/true' if v else '/false')
+                dp['/' + k.lstrip('/')] = v
             xobj.DecodeParms = dp
 
         # Alpha/透明度: 添加SMask
