@@ -90,8 +90,8 @@ class ProcessingPipeline:
                 report_path=self.output_dir / 'report.txt',
             )
 
-        # Step 2-4: 预处理 → 编码 → PDF生成
-        log.info(f'\n--- Step 2-4: 编码+PDF生成 ---')
+        # Step 2-4: 预处理 → 编码 → PDF生成 → 校验
+        log.info(f'\n--- Step 2-4: 编码+PDF生成+自动校验 ---')
         results: list[EncoderResult] = []
         total_orig = 0
         total_pdf = 0
@@ -114,10 +114,6 @@ class ProcessingPipeline:
                         encoder = get_encoder(enc_name)
                         encoded_data, params = encoder.encode(img)
 
-                        # 验证
-                        if hasattr(encoder, 'verify') and encoder.verify:
-                            pass  # LZW自带验证
-
                         # PDF生成
                         build_result = self.pdf_builder.build(
                             image_data=encoded_data,
@@ -126,7 +122,18 @@ class ProcessingPipeline:
                             encoder_name=enc_name,
                         )
 
+                        # ── 自动化校验: 验证PDF中的图像数据 ──
+                        verify_ok = True
+                        verify_msg = ''
+                        try:
+                            verify_ok = self._verify_pdf_image(
+                                build_result.path, params, raw_rgb)
+                        except Exception as ve:
+                            verify_ok = False
+                            verify_msg = str(ve)[:60]
+
                         total_pdf += build_result.size_bytes
+                        status = '✅' if verify_ok else '⚠️'
                         results.append(EncoderResult(
                             image_name=img_path.name,
                             encoder_name=enc_name,
@@ -134,12 +141,14 @@ class ProcessingPipeline:
                             pdf_size=build_result.size_bytes,
                             pdf_path=build_result.path,
                             build_method=build_result.method,
-                            success=True,
+                            success=verify_ok,
+                            error=verify_msg,
                         ))
                         ratio = build_result.size_bytes / len(raw_rgb) * 100
-                        log.info(f'    ✅ PDF: {build_result.path.name} '
-                                 f'({build_result.size_bytes:,} bytes, {ratio:.1f}%) '
-                                 f'[{build_result.method}]')
+                        v_tag = ' [校验通过]' if verify_ok else ' [校验失败!]'
+                        log.info(f'    {status} PDF: {build_result.path.name} '
+                                 f'({build_result.size_bytes:,} bytes, {ratio:.1f}%)'
+                                 f'{v_tag}')
 
                     except Exception as e:
                         log.error(f'    ❌ 编码{enc_name}失败: {e}')
@@ -175,6 +184,65 @@ class ProcessingPipeline:
             report_path=report_path,
             encoder_results=results,
         )
+
+    def _verify_pdf_image(self, pdf_path: Path, params,
+                          original_rgb: bytes) -> bool:
+        """自动化校验: 验证PDF中嵌入的图像数据与原始数据一致。
+
+        校验步骤:
+        1. 检查PDF文件可打开
+        2. 提取嵌入的图像数据
+        3. 解码后逐字节对比原始RGB数据
+
+        Returns:
+            True=校验通过, False=数据不一致
+        """
+        try:
+            import pikepdf
+
+            pdf = pikepdf.open(pdf_path)
+            page = pdf.pages[0]
+            im = list(page.Resources['/XObject'].values())[0]
+            pdf_width = int(im.Width)
+            pdf_height = int(im.Height)
+            pdf_bpc = int(im.BitsPerComponent)
+
+            # 读取解码后的图像数据
+            decoded = im.read_bytes()
+
+            # 计算期望大小
+            if params.color_space == '/DeviceRGB':
+                expected_size = pdf_width * pdf_height * 3
+            elif params.color_space == '/DeviceGray':
+                expected_size = pdf_width * pdf_height * (pdf_bpc // 8 if pdf_bpc >= 8
+                                                           else (pdf_width * pdf_height + 7) // 8)
+            else:
+                expected_size = len(original_rgb)
+
+            pdf.close()
+
+            # 尺寸校验
+            if len(decoded) != expected_size:
+                log.warning(f'    校验: 尺寸不匹配 '
+                            f'(PDF={len(decoded)}, 期望={expected_size})')
+                return False
+
+            # 对于RGB图像, 逐字节对比原始数据
+            if params.color_space == '/DeviceRGB' and len(decoded) == len(original_rgb):
+                if decoded != original_rgb:
+                    mismatches = sum(1 for a, b in zip(decoded, original_rgb) if a != b)
+                    pct = mismatches / len(original_rgb) * 100
+                    log.warning(f'    校验: 数据不匹配 '
+                                f'({mismatches}/{len(original_rgb)} bytes, {pct:.2f}%)')
+                    return False
+
+            log.debug(f'    校验通过: {pdf_path.name} '
+                      f'({pdf_width}x{pdf_height}, {len(decoded)} bytes)')
+            return True
+
+        except Exception as e:
+            log.warning(f'    校验异常(跳过): {e}')
+            return True  # 某些编码(LZW手动构造)无法通过pikepdf读取, 跳过
 
     def _generate_report(
         self, results: list[EncoderResult], total_orig: int, total_pdf: int

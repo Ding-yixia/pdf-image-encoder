@@ -10,6 +10,8 @@ from .lzw import LZWEncoder
 
 from .alpha import AlphaEncoder
 
+from .jbig2 import JBIG2Encoder
+
 REGISTRY: dict[str, type[Encoder]] = {
     'Raw':   RawEncoder,
     'Flate': FlateEncoder,
@@ -19,6 +21,7 @@ REGISTRY: dict[str, type[Encoder]] = {
     'RLE':   RLEEncoder,
     'LZW':   LZWEncoder,
     'Alpha': AlphaEncoder,
+    'JBIG2': JBIG2Encoder,
 }
 
 def get_encoder(name: str) -> Encoder:
