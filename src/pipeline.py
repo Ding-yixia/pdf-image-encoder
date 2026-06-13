@@ -112,7 +112,20 @@ class ProcessingPipeline:
                     try:
                         # 编码
                         encoder = get_encoder(enc_name)
-                        encoded_data, params = encoder.encode(img)
+
+                        # Alpha编码: 加载RGBA + 挖空效果
+                        if enc_name == 'Alpha':
+                            img_alpha = self.preprocessor.process(
+                                img_path, mode='RGBA'
+                            )
+                            from src.effects.transparency_cutout import (
+                                TransparencyCutout,
+                            )
+                            cutout = TransparencyCutout()
+                            img_alpha = cutout.apply(img_alpha)
+                            encoded_data, params = encoder.encode(img_alpha)
+                        else:
+                            encoded_data, params = encoder.encode(img)
 
                         # PDF生成
                         build_result = self.pdf_builder.build(
